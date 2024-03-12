@@ -1,0 +1,6 @@
+sims_features1.csv = make_features(step=25,window=50,hrv=nk_karlson_hrv,scaler=RobustScaler(with_centering=True,with_scaling=True),avg_phase=False)
+sims_features2.csv = make_features(step=25,window=50,hrv=nk_karlson_hrv,scaler=RobustScaler(with_centering=True,with_scaling=True),avg_phase=True)
+sims_features3.csv = make_features(step=25,window=50,hrv=nk_karlson_hrv,scaler=RobustScaler(with_centering=True,with_scaling=False),avg_phase=False)
+sims_features4.csv = make_features(step=25,window=50,hrv=nk_karlson_hrv,scaler=RobustScaler(with_centering=True,with_scaling=False),avg_phase=True)
+sims_features5.csv = make_features(step=None,window=None,hrv=nk_karlson_hrv,scaler=RobustScaler(with_centering=True,with_scaling=True))
+sims_features6.csv = make_features(step=None,window=None,hrv=nk_karlson_hrv,scaler=RobustScaler(with_centering=True,with_scaling=False))
