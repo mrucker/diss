@@ -1,5 +1,6 @@
+*.csv
+*.xlsx
 .vscode
-sims_features.csv
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
