@@ -3,9 +3,10 @@ import parameterfree
 
 def evaluator(args):
 
-    exp,t,device = args
+    exp,t,device,seed = args
 
     torch.set_num_threads(t)
+    torch.manual_seed(seed)
 
     b,e   = exp._b,exp._e
     data  = exp.load_data()
