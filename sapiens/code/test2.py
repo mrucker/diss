@@ -1,7 +1,11 @@
+#Setup Code
+
 import csv
+import warnings
+import pickle
 from pathlib import Path
 from collections import defaultdict, Counter
-from itertools import islice, chain, count, product, repeat
+from itertools import islice, chain, count, product
 from contextlib import nullcontext
 from concurrent.futures import ProcessPoolExecutor
 
@@ -14,12 +18,10 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from sklearn.preprocessing import StandardScaler
-from sklearn.model_selection import StratifiedShuffleSplit
+from sklearn.model_selection import StratifiedShuffleSplit, ShuffleSplit
 from parameterfree import COCOB
 from imblearn.under_sampling import RandomUnderSampler
 from imblearn.over_sampling import RandomOverSampler
-
-from IPython.display import clear_output
 
 try:
     torch.set_num_threads(3)
@@ -61,57 +63,52 @@ def make_emotions_df():
         df["RelDay"] = df["Day"]-df["StartDay"]
         return df
 
-    def scale(df, group_col, scale_col, scaler, postfix):
-        for gid in set(df[group_col]):
-            df.loc[df[group_col]==gid,[scale_col+postfix]] = scaler.fit_transform(df.loc[df[group_col]==gid,[scale_col]])
-
     def drop_all1_ends(df):
-
-        drop = df.copy()
-        keep = df.copy()
+        last, last_gt_1, keep = df.copy(),df.copy(), df.copy()
         
-        drop = drop[drop["State Anxiety"]!= 1]
-        drop = drop.groupby("ParticipantId")["RelDay"].max().reset_index()
-        drop = drop.rename(columns={"RelDay":"Last Day With Anxiety > 1"})
-        drop = drop[drop["Last Day With Anxiety > 1"] <= 8 ]
+        last_gt_1 = last_gt_1[last_gt_1["State Anxiety"]!= 1]
+        last_gt_1 = last_gt_1.groupby("ParticipantId")["RelDay"].max().reset_index()
+        last_gt_1 = last_gt_1.rename(columns={"RelDay":"Last Day > 1"})
 
-        for pid,day in drop.itertuples(index=False):
-            is_not_pid = keep["ParticipantId"] != pid
-            is_lt_day  = keep["RelDay"] < day
-            keep = keep[is_not_pid | is_lt_day]
+        last = last.groupby("ParticipantId")["RelDay"].max().reset_index()
+        last = last.rename(columns={"RelDay":"Last Day"})
+
+        for pid in last["ParticipantId"]:
+            
+            last_day = last[last["ParticipantId"]==pid]["Last Day"].item()
+            last_day_gt_1 = last_gt_1[last_gt_1["ParticipantId"]==pid]["Last Day > 1"].item()
+            
+            if last_day-last_day_gt_1 >= 3:
+                is_not_pid = keep["ParticipantId"] != pid
+                is_lt_day  = keep["RelDay"] <= last_day_gt_1
+                keep = keep[is_not_pid | is_lt_day]
 
         return keep
 
-    def get_trimmed_pids(df):
-        df = df.copy()
-        df = df[~df["ER Interest"].isna()]
-        df = df.groupby(["ParticipantId","RelDay"]).size().reset_index(drop=False)
-        df = df.groupby(['ParticipantId']).size().reset_index(drop=False).rename(columns={0:"Count"})
-        return df.loc[df.Count < 6,'ParticipantId'].tolist()
-
-    runs_df = pd.read_csv(f'{data_dir}/Runs.csv')
-    states_df = pd.read_csv(f'{data_dir}/States.csv')
     emotions_df = pd.read_csv(f'{data_dir}/Emotions.csv')
     participant_df = pd.read_csv(f'{data_dir}/Participants.csv')
 
     emotions_df = emotions_df[emotions_df["WatchDataQuality"] == "Good"]
 
+    emotions_df["State Anxiety"] = pd.to_numeric(emotions_df["State Anxiety"], errors='coerce')
     emotions_df["ER Interest"] = pd.to_numeric(emotions_df["ER Interest"], errors='coerce')
     emotions_df["Phone ER Interest"] = pd.to_numeric(emotions_df["Phone ER Interest"], errors='coerce')
     emotions_df["Response Time (min)"] = (emotions_df["SubmissionTimestampUtc"] - emotions_df["DeliveredTimestampUtc"])/60
+    emotions_df["Response Time (sec)"] = (emotions_df["SubmissionTimestampUtc"] - emotions_df["DeliveredTimestampUtc"])
+    emotions_df["Response Time (log min)"] = np.log((1+ emotions_df["SubmissionTimestampUtc"] - emotions_df["DeliveredTimestampUtc"])/60)
+    emotions_df["Response Time (log sec)"] = np.log((1+ emotions_df["SubmissionTimestampUtc"] - emotions_df["DeliveredTimestampUtc"]))
 
-    runs_df = add_day_columns(runs_df, "DeliveredTimestampUtc", participant_df)
-    states_df = add_day_columns(states_df, "TimestampUtc", participant_df)
-    emotions_df = add_day_columns(emotions_df, "OpenedTimestampUtc", participant_df)
+    emotions_df["State Anxiety (z)"] = float('nan')
+    emotions_df["ER Interest (z)"] = float('nan')
 
-    to_trim = get_trimmed_pids(emotions_df)
+    for pid in set(emotions_df["ParticipantId"].tolist()):
+        is_pid = emotions_df["ParticipantId"] == pid
+        is_anx = emotions_df["State Anxiety"] > 1
+        emotions_df.loc[is_pid,["ER Interest (z)"]] = StandardScaler().fit_transform(emotions_df.loc[is_pid,["ER Interest"]])
+        emotions_df.loc[is_pid&is_anx,["State Anxiety (z)"]] = StandardScaler().fit_transform(emotions_df.loc[is_pid&is_anx,["State Anxiety"]])
 
-    runs_df = runs_df[~runs_df["ParticipantId"].isin(to_trim)]
-    states_df = states_df[~states_df["ParticipantId"].isin(to_trim)]
-    emotions_df = emotions_df[~emotions_df["ParticipantId"].isin(to_trim)]
+    emotions_df = add_day_columns(emotions_df, "DeliveredTimestampUtc", participant_df)
 
-    runs_df = runs_df[runs_df["RelDay"] < 11]
-    states_df = states_df[states_df["RelDay"] < 11]
     emotions_df = emotions_df[emotions_df["RelDay"] < 11]
 
     return drop_all1_ends(emotions_df)
@@ -202,6 +199,28 @@ class TheoryGridCellSpatialRelationEncoder:
         
         return spr_embeds.squeeze().tolist()
 
+def is_gt(values,val):
+    out = (values > val).astype(float)
+    out[values.isna()] = float('nan')
+    return out
+
+def is_lt(values,val):
+    out = (values < val).astype(float)
+    out[values.isna()] = float('nan')
+    return out
+
+def scale(values):
+    with warnings.catch_warnings():
+        # If a column has all nan then a warning is thrown
+        # We supress that warning because that can happen
+        warnings.simplefilter("ignore")
+        return StandardScaler().fit_transform(values).tolist()
+
+def add1(X):
+    for x,z in zip(X,np.isnan(X).all(axis=1).astype(int)):
+        x.append(z)
+    return X
+
 def wins(file_path, timestamps, window_len):
     file = open(file_path) if Path(file_path).exists() else nullcontext()
     rows = islice(csv.reader(file),1,None) if Path(file_path).exists() else [] #type: ignore
@@ -211,37 +230,51 @@ def wins(file_path, timestamps, window_len):
             window = []
             for row in rows:
                 if float(row[0]) < timestamp-window_len: continue
-                if float(row[0]) > timestamp: break
+                if float(row[0]) >= timestamp: break
                 data = map(float,row[1:])
                 window.append(next(data) if len(row) == 2 else tuple(data))
             yield window
 
 def dems(pid, timestamps):
-    df = pd.read_csv(f'{data_dir}/Baseline.csv',header=None)
-    i = df[0].tolist().index(pid)
-    return df.to_numpy()[:, 2:-109][[i]*len(timestamps),:]
+    df = pd.read_csv(f'{data_dir}/Baseline.csv')
+    i = df["pid"].tolist().index(pid)
+    return df.to_numpy()[[i]*len(timestamps), 1:].tolist()
 
-def add1(X):
-    for x,z in zip(X,np.isnan(X).all(axis=1).astype(int)):
-        x.append(z)
-    return X
+def cacher(sensor,pid,ts,maker,*args):
+    filename = f"{sensor}_{int(sum(ts))}_{args}_{pid}.pkl"
+    features = load_feats(filename)
+    if features: return features
+    features = maker(pid,ts,*args)
+    save_feats(filename,features)
+    return features
 
 def hrs(pid, timestamps, secs):
     features = []
-    for w in wins(f"{data_dir}/phone/{pid}/HeartRate.csv", timestamps, secs):
+    for w in wins(f"{data_dir}/watch/{pid}/HeartRate.csv", timestamps, secs):
         w = list(filter(None,w))
         if w: features.append([np.mean(w),np.std(w)])
         else: features.append([float('nan')]*2)
     assert len(set(map(len,features))) == 1, 'hrs'
-    return StandardScaler().fit_transform(features).tolist() #type: ignore
+    return scale(features)
 
-def scs(pid, timestamps, secs):
+def scs1(pid, timestamps, secs):
+    features = []
+    if features: return features
+
+    for w in wins(f"{data_dir}/watch/{pid}/StepCount.csv", timestamps, secs):
+        if len(w)>1: features.append([np.mean(np.diff(w)),np.std(np.diff(w))])
+        else: features.append([float('nan')]*2)
+    assert len(set(map(len,features))) == 1, 'scs1'
+
+    return scale(features)
+
+def scs2(pid, timestamps, secs):
     features = []
     for w in wins(f"{data_dir}/watch/{pid}/StepCount.csv", timestamps, secs):
-        if w: features.append([np.mean(np.diff(w)),np.std(np.diff(w))])
-        else: features.append([float('nan')]*2)
-    assert len(set(map(len,features))) == 1, 'scs'
-    return StandardScaler().fit_transform(features).tolist() #type: ignore
+        if len(w)>1: features.append([np.max(w)-np.min(w)])
+        else: features.append([float('nan')])
+    assert len(set(map(len,features))) == 1, 'scs2'
+    return scale(features)
 
 def lins1(pid, timestamps, secs):
     features = []
@@ -249,7 +282,7 @@ def lins1(pid, timestamps, secs):
         if w: features.append([*np.var(w,axis=0),*np.percentile([np.linalg.norm(w,axis=1)],q=[10,50,90])])
         else: features.append([float('nan')]*6)
     assert len(set(map(len,features))) == 1, 'lins1'
-    return StandardScaler().fit_transform(features).tolist() #type: ignore
+    return scale(features)
 
 def lins2(pid, timestamps, secs):
     features = []
@@ -257,34 +290,69 @@ def lins2(pid, timestamps, secs):
         if w: features.append([*np.var(w,axis=0),*np.percentile([np.linalg.norm(w,axis=1)],q=[10,50,90])])
         else: features.append([float('nan')]*6)
     assert len(set(map(len,features))) == 1, 'lins2'
-    return StandardScaler().fit_transform(features).tolist() #type: ignore
+    return scale(features)
 
-def bats(pid, timestamps, secs):
+def lins3(pid, timestamps, secs):
+    features = []
+    for w in wins(f"{data_dir}/phone/{pid}/LinearAcceleration.csv", timestamps, secs):
+        if w: features.append([np.mean(np.linalg.norm(w,axis=1)), *np.std(w,axis=0)])
+        else: features.append([float('nan')]*4)
+    assert len(set(map(len,features))) == 1, 'lins3'
+    return scale(features)
+
+def lins4(pid, timestamps, secs):
+    features = []
+    for w in wins(f"{data_dir}/watch/{pid}/LinearAcceleration.csv", timestamps, secs):
+        if w: features.append([np.mean(np.linalg.norm(w,axis=1)), *np.std(w,axis=0)])
+        else: features.append([float('nan')]*4)
+    assert len(set(map(len,features))) == 1, 'lins2'
+    return scale(features)
+
+def bats1(pid, timestamps, secs):
     features = []
     for w in wins(f"{data_dir}/phone/{pid}/Battery.csv", timestamps, secs):
         w = [float(w)/100 for w in w]
-        if w: features.append([np.max(w)-np.min(w),np.mean(np.diff(w)),np.std(np.diff(w))])
+        if len(w)==1: features.append([0,float('nan'),float('nan')])
+        elif len(w)>1: features.append([np.max(w)-np.min(w),np.mean(np.diff(w)),np.std(np.diff(w))])
         else: features.append([float('nan')]*3)
-        assert len(set(map(len,features))) == 1, 'bats'
+        assert len(set(map(len,features))) == 1, 'bats1'
     return features
 
-def peds(pid, timestamps, secs):
+def bats2(pid, timestamps, secs):
+    features = []
+    for w in wins(f"{data_dir}/phone/{pid}/Battery.csv", timestamps, secs):
+        w = [float(w)/100 for w in w]
+        if w: features.append([np.mean(w),np.max(w)-np.min(w)])
+        else: features.append([float('nan')]*2)
+        assert len(set(map(len,features))) == 1, 'bats2'
+    return features
+
+def peds1(pid, timestamps, secs):
     features = []
     for w in wins(f"{data_dir}/phone/{pid}/Pedometer.csv", timestamps, secs):
-        if w: features.append([np.mean(np.diff(w)),np.max(w)-np.min(w),np.std(np.diff(w))])
+        if len(w)==1: features.append([float('nan'),0,float('nan')])
+        elif len(w)>1: features.append([np.mean(np.diff(w)),np.max(w)-np.min(w),np.std(np.diff(w))])
         else: features.append([float('nan')]*3)
-        assert len(set(map(len,features))) == 1, 'peds'
-    return StandardScaler().fit_transform(features).tolist() #type: ignore
+        assert len(set(map(len,features))) == 1, 'peds1'
+    return scale(features)
 
-def locs1(pid, timestamps, secs, init, freq, lmin, lmax):
+def peds2(pid, timestamps, secs):
+    features = []
+    for w in wins(f"{data_dir}/phone/{pid}/Pedometer.csv", timestamps, secs):
+        if len(w)>1: features.append([np.max(w)-np.min(w)])
+        else: features.append([float('nan')])
+        assert len(set(map(len,features))) == 1, 'peds2'
+    return scale(features)
+
+def locs1(pid, timestamps, secs, freq, lmin, lmax):
     features = []
     for w in wins(f"{data_dir}/phone/{pid}/Location.csv", timestamps, secs):
         if w: features.append([*np.mean(w,axis=0)[1:]])
         else: features.append([float('nan')]*2)
-    out = TheoryGridCellSpatialRelationEncoder(frequency_num=freq,max_radius=lmax,min_radius=lmin,freq_init=init).make_input_embeds(features)
+    out = TheoryGridCellSpatialRelationEncoder(frequency_num=freq,min_radius=lmin,max_radius=lmax,freq_init='geometric').make_input_embeds(features)
     return [out] if len(timestamps) == 1 else out
 
-def locs2(pid, timestamps, secs, freq, lmax, lmin, init):
+def locs2(pid, timestamps, secs):
     features = []
     for w in wins(f"{data_dir}/phone/{pid}/Location.csv", timestamps, secs):
         if w: features.append([*np.mean(w,axis=0)[1:]])
@@ -294,104 +362,143 @@ def locs2(pid, timestamps, secs, freq, lmax, lmin, init):
 def tims(timestamps,tzs):
     hour, day = 60*60, 60*60*24
     for timestamp,tz in zip(timestamps,tzs):
-        if   tz == "-04:00": timestamp -= 4*hour
-        elif tz == "-05:00": timestamp -= 5*hour
-        time_of_day = (timestamp/day) % 1
-        day_of_week = (int(timestamp/day)+4) % 7
-        is_weekend = day_of_week in [0,6]
-        is_weekday = day_of_week in [1,2,3,4,5]
-        yield [time_of_day,int(is_weekend),int(is_weekday)]
+        if np.isnan(timestamp): 
+            yield [float('nan')]*3
+        else:
+            if   tz == "-04:00": timestamp -= 4*hour
+            elif tz == "-05:00": timestamp -= 5*hour
+            time_of_day = (timestamp/day) % 1
+            day_of_week = (int(timestamp/day)+4) % 7
+            is_weekend = day_of_week in [0,6]
+            is_weekday = day_of_week in [1,2,3,4,5]
+            yield [time_of_day,int(is_weekend),int(is_weekday)]
+
+def save_feats(filename,feats):
+    if not Path(f"{data_dir}/feats/{filename}").exists():
+        with open(f"{data_dir}/feats/{filename}", "wb") as f: # Use "wb" for binary write mode
+            pickle.dump(feats, f)
+
+def load_feats(filename):
+    if not Path(f"{data_dir}/feats/{filename}").exists():
+        return None
+    else:
+        try:
+            with open(f"{data_dir}/feats/{filename}", "rb") as f: # Use "wb" for binary write mode
+                return pickle.load(f)
+        except:
+            Path(f"{data_dir}/feats/{filename}").unlink()
+            return None
 
 def make_xyg1(work_item):
-    (pid,ts,tz,ys,args) = work_item
-    #hrs, scs, lins, bats, peds, locs
-    fs = [
-        locs1(pid,ts,*args[5]),
-        lins1(pid,ts,*args[2]),
-        tims(ts,tz),
-        bats(pid,ts,*args[3]),
-        peds(pid,ts,*args[4])
-    ]
+    (pid,ts,tz,ys,args,secs) = work_item
+
+    fs = []
+
+    if args[0]: fs.append(list(tims(ts,tz)))
+    if args[1]: fs.append(list(cacher("hrs"  ,pid,ts,hrs  ,args[1])))
+    if args[2]: fs.append(list(cacher("scs1" ,pid,ts,scs1 ,args[2])))
+    if args[3]: fs.append(list(cacher("lins1",pid,ts,lins1,args[3])))
+    if args[4]: fs.append(list(cacher("lins2",pid,ts,lins2,args[4])))
+    if args[5]: fs.append(list(cacher("bats1",pid,ts,bats1,args[5])))
+    if args[6]: fs.append(list(cacher("peds1",pid,ts,peds1,args[6])))
+    if args[7]: fs.append(list(cacher("locs1",pid,ts,locs1,*args[7])))
+    if args[8]: fs.append(list(cacher("locs2",pid,ts,locs2,args[8])))
+
+    if args[10]:
+        for f in fs: add1(f)
+
+    if args[9]: fs.append(list(dems(pid,ts)))
+
+    os = list(ys)
     xs = [list(chain.from_iterable(feats)) for feats in zip(*fs)]
-    ys = [float(y<np.mean(ys)) for y in ys]
     gs = [pid]*len(ys)
+
+    for sec in (secs or []):
+        nts = [t-sec for t in ts]
+        nxs,nys,ngs = make_xyg2((pid,nts,tz,os,args,0))
+        xs += nxs
+        ys += nys
+        gs += ngs
+
     return xs,ys,gs
 
 def make_xyg2(work_item):
-    (pid,ts,tz,ys,args) = work_item
-    #hrs, scs, lins, bats, peds, locs
-    fs = [
-        locs1(pid,ts,*args[5]),
-        lins1(pid,ts,*args[2]),
-        lins2(pid,ts,*args[2]),
-        scs(pid,ts,*args[1]),
-        hrs(pid,ts,*args[0]),
-        tims(ts,tz),
-        bats(pid,ts,*args[3]),
-        peds(pid,ts,*args[4])
-    ]
+    (pid,ts,tz,ys,args,secs) = work_item
+
+    fs = []
+
+    if args[0]: fs.append(list(tims(ts,tz)))
+    if args[1]: fs.append(list(cacher("hrs"  ,pid,ts,hrs  ,args[1])))
+    if args[2]: fs.append(list(cacher("scs2" ,pid,ts,scs2 ,args[2])))
+    if args[3]: fs.append(list(cacher("lins3",pid,ts,lins3,args[3])))
+    if args[4]: fs.append(list(cacher("lins4",pid,ts,lins4,args[4])))
+    if args[5]: fs.append(list(cacher("bats2",pid,ts,bats2,args[5])))
+    if args[6]: fs.append(list(cacher("peds2",pid,ts,peds2,args[6])))
+    if args[7]: fs.append(list(cacher("locs1",pid,ts,locs1,*args[7])))
+    if args[8]: fs.append(list(cacher("locs2",pid,ts,locs2,args[8])))
+
+    if args[10]:
+        for f in fs: add1(f)
+
+    if args[9]: fs.append(list(dems(pid,ts)))
+
+    os = list(ys)
     xs = [list(chain.from_iterable(feats)) for feats in zip(*fs)]
-    ys = [float(y<np.mean(ys)) for y in ys]
     gs = [pid]*len(ys)
+
+    for sec in (secs or []):
+        if sec != 0:
+            nts = [t-sec for t in ts]
+            nxs,nys,ngs = make_xyg2((pid,nts,tz,os,args,0))
+            xs += nxs
+            ys += nys
+            gs += ngs
+
     return xs,ys,gs
 
-def make_xyg3(work_item):
-    (pid,ts,tz,ys,args) = work_item
-    #hrs, scs, lins, bats, peds, locs
-    fs = [
-        locs1(pid,ts,*args[5]),
-        lins1(pid,ts,*args[2]),
-        scs(pid,ts,*args[1]),
-        hrs(pid,ts,*args[0]),
-        tims(ts,tz),
-        bats(pid,ts,*args[3]),
-        peds(pid,ts,*args[4])
-    ]
-    xs = [list(chain.from_iterable(feats)) for feats in zip(*fs)]
-    ys = [float(y<np.mean(ys)) for y in ys]
-    gs = [pid]*len(ys)
-    return xs,ys,gs
+can_predict = emotions_df.copy().sort_values(["ParticipantId","DeliveredTimestampUtc"])
 
-def make_xyg4(work_item):
-    (pid,ts,tz,ys,args) = work_item
-    #hrs, scs, lins, bats, peds, locs
-    fs = [
-        locs1(pid,ts,*args[5]),
-        lins1(pid,ts,*args[2]),
-        tims(ts,tz),
-        bats(pid,ts,*args[3]),
-        peds(pid,ts,*args[4]),
-        dems(pid,ts)
-    ]
-    xs = [list(chain.from_iterable(feats)) for feats in zip(*fs)]
-    ys = [float(y<np.mean(ys)) for y in ys]
-    gs = [pid]*len(ys)
-    return xs,ys,gs
+def work_items(tims:bool,hrs:int,scs:int,lins1:int,lins2:int,bats:int,peds:int,locs1,locs2:int,dems:bool,add1:bool,event:str,secs=[]):
 
-def make_xyg5(work_item):
-    (pid,ts,tz,ys,args,ind) = work_item
-    #hrs, scs, lins, bats, peds, locs
-    fs = [
-        locs1(pid,ts,*args[5]),
-        lins1(pid,ts,*args[2]),
-        tims(ts,tz),
-        bats(pid,ts,*args[3]),
-        peds(pid,ts,*args[4])
-    ]
+    df = can_predict[~can_predict["SubmissionTimestampUtc"].isna()]
 
-    if ind:
-        for f in fs:
-            add1(f)
+    for pid in sorted(df["ParticipantId"].drop_duplicates().tolist()):
+        ptc  = df[df.ParticipantId == pid]
+        tss  = ptc["SubmissionTimestampUtc" if event == "sub" else "DeliveredTimestampUtc"].tolist() 
+        tzs  = ptc["LocalTimeZone"].tolist()
 
-    xs = [list(chain.from_iterable(feats)) for feats in zip(*fs)]
-    ys = [float(y<np.mean(ys)) for y in ys]
-    gs = [pid]*len(ys)
-    return xs,ys,gs
+        y0s = torch.tensor(is_gt(ptc["ER Interest (z)"],0).tolist())
+        y1s = torch.tensor(is_lt(ptc['Response Time (min)'],10).tolist())
+        y2s = torch.tensor(is_gt(ptc["State Anxiety (z)"],0).tolist())
+        y3s = torch.tensor(is_gt(ptc["State Anxiety"], 1).tolist())
+        y4s = torch.tensor(ptc["Response Time (log sec)"].tolist())
+        y5s = torch.tensor(ptc["ER Interest (z)"].tolist())
+        y6s = torch.tensor(ptc["State Anxiety (z)"].tolist())
 
-can_predict = emotions_df[(emotions_df["WatchDataQuality"] == "Good") & ~emotions_df["ER Interest"].isna()].copy()
-can_predict = can_predict.sort_values(["ParticipantId","SubmissionTimestampUtc"])
+        ys = torch.hstack((
+            y0s.unsqueeze(1),
+            y1s.unsqueeze(1),
+            y2s.unsqueeze(1),
+            y3s.unsqueeze(1),
+            y4s.unsqueeze(1),
+            y5s.unsqueeze(1),
+            y6s.unsqueeze(1)
+        )).tolist()
 
-########################################################################################
+        args = [tims,hrs,scs,lins1,lins2,bats,peds,locs1,locs2,dems,add1]
+
+        yield pid,tss,tzs,ys,args,secs
+
+#with ProcessPoolExecutor(max_workers=20) as executor:
+X,Y,G = zip(*map(make_xyg2, work_items(True,0,0,300,0,300,300,[300,2,1,2],0,False,True,"del")))
+
+Y = torch.tensor(list(chain.from_iterable(Y))).float()
+G = torch.tensor(list(chain.from_iterable(G))).int()
+G = G[~torch.isnan(Y[:,[0,1]]).any(dim=1)]
+
+testable_G = cb.CobaRandom(1).shuffle([k for k,n in Counter(G.tolist()).items() if n >= 30])
+
+#########################################################################################
 
 class FeedForward(torch.nn.Sequential):
     """A Generic implementation of Feedforward Neural Network"""
@@ -402,6 +509,10 @@ class FeedForward(torch.nn.Sequential):
             self.layers = layers
         def forward(self,X):
             return X + self.layers(X)
+        
+    class ForceOneModule(torch.nn.Module):
+        def forward(self,X):
+            return torch.ones(size=(X.shape[0],1)).float()
 
     def make_layer(self,curr_dim,spec):
         if isinstance(spec,float):
@@ -418,6 +529,8 @@ class FeedForward(torch.nn.Sequential):
             return torch.nn.BatchNorm1d(curr_dim), curr_dim
         if spec == 's':
             return torch.nn.Sigmoid(),curr_dim
+        if spec == '1':
+            return FeedForward.ForceOneModule(), 1
         if isinstance(spec,list):                
             return FeedForward.SkipModule(FeedForward([curr_dim] + spec)), curr_dim
         raise Exception(f"Bad Layer: {spec}")
@@ -446,82 +559,47 @@ class FeedForward(torch.nn.Sequential):
         self.params = {"specs": specs, "rng": rng }
 
 class MyEnvironment:
-    def __init__(self, train_X, train_Y, train_G, test_X, test_Y, trn, g, rng):
-        self.params = {'pid': g, 'rng': rng, 'trn':trn}
-        self.train_X = train_X
-        self.train_Y = train_Y.float()
-        self.train_G = train_G
-        self.test_X = test_X
-        self.test_Y = test_Y.float()
+    def __init__(self, a, L, g, rng, v=2):
+        self.params = {'rng': rng, 'trn':a, 'l':L, 'v':v, 'g':g }
+        self.X = None
+        self.Y = None
+        self.G = None
+        self.a = list(a)
+        self.L = L
+        self.g = g
+        self.v = v
+        self.a[7] = [a[7],2,1,10] if a[7] else None
 
-    def ssl(self,neg,sr,yi):
-        from itertools import compress, repeat, chain
-        from operator import eq
+    def get_data(self):
+        import torch
+        import itertools as it
 
-        rng = cb.CobaRandom(self.params['rng'])
-        rng_order = rng.shuffle(range(len(self.train_X)))
+        if self.X is not None: return self.X,self.Y,self.G
+        make = make_xyg1 if self.v == 1 else make_xyg2
 
-        X = self.train_X.tolist()
-        Y = self.train_Y[:,yi]
-        Y = list(map(tuple,Y.tolist()))
+        X,Y,G = zip(*map(make, work_items(*self.a)))
 
-        X = list(map(X.__getitem__,rng_order))
-        Y = list(map(Y.__getitem__,rng_order))
+        X = torch.tensor(list(it.chain.from_iterable(X))).float()
+        Y = torch.tensor(list(it.chain.from_iterable(Y))).float()
+        G = torch.tensor(list(it.chain.from_iterable(G))).int()
 
-        eq_class  = {y: list(compress(X,map(eq,Y,repeat(y)))) for y in set(Y)}
-        ne_class  = {y: list(chain(*[v for k,v in eq_class.items() if k != y ])) for y in set(Y)}
+        self.X,self.Y,self.G = X,Y,G
 
-        def choose_unique(items,given_i):
-            if len(items) == 1:  return items[0]
-            for i in rng.randints(None,0,len(items)-1):
-                if i != given_i:
-                    return items[i]
+        if X.shape[0] == 0: return
 
-        def choose_n(items,n):
-            add_to_index = (indexes := set()).add if len(items) > n else (indexes := []).append
-            for i in rng.randints(None,0,len(items)-1):
-                add_to_index(i)
-                if len(indexes)==n:
-                    return [items[i] for i in indexes]
+        any_na = torch.isnan(Y[:,[0,1]]).any(dim=1)
+        X = X[~any_na]
+        Y = Y[~any_na].float()
+        G = G[~any_na]
 
-        if sr < 1:
-            anchor, positive, negative = [], [], []
+        rng_indexes = cb.CobaRandom(self.params['rng']).shuffle(range(len(X)))
 
-            for i in range(int(len(X)*sr)):
-                x,y = X[i],Y[i]
-                anchor.append(x)
-                positive.append(choose_unique(eq_class[y],i))
-                negative.append(choose_n     (ne_class[y],neg))
-            yield torch.tensor(anchor).float(), torch.tensor(positive).float(), torch.tensor(negative).float()
+        self.X,self.Y,self.G = X[rng_indexes],Y[rng_indexes],G[rng_indexes]
 
-        else:
-            for _ in range(sr):
-                anchor, positive, negative = [], [], []
-                for i in range(len(X)):
-                    x,y = X[i],Y[i]
-                    anchor.append(x)
-                    positive.append(choose_unique(eq_class[y],i))
-                    negative.append(choose_n     (ne_class[y],neg))
-
-                yield torch.tensor(anchor).float(), torch.tensor(positive).float(), torch.tensor(negative).float()
-
-    def train(self):
-        new_id = defaultdict(lambda c= count(0):next(c))
-        sampler = RandomOverSampler(random_state=self.params['rng'])
-        _Z = [ new_id[z] for z in zip(self.train_Y.squeeze().tolist(),self.train_G.squeeze().tolist()) ]
-        _I = sampler.fit_resample(torch.arange(len(self.train_X)).unsqueeze(1),_Z)[0] #type: ignore
-        _Y = self.train_Y[_I.squeeze()]
-        _X = self.train_X[_I.squeeze()]
-        _G = self.train_G[_I.squeeze()]
-        rng_indexes = cb.CobaRandom(self.params['rng']).shuffle(range(len(_X)))
-        return _X[rng_indexes,:], _Y[rng_indexes,:], _G[rng_indexes]
-    
-    def test(self):
-        rng_indexes = cb.CobaRandom(self.params['rng']).shuffle(range(len(self.test_X)))
-        return self.test_X[rng_indexes,:], self.test_Y[rng_indexes]
+        return self.X,self.Y,self.G
 
 class MyEvaluator:
-    def __init__(self, s1, s2, s3, dae_steps, dae_dropn, ws_steps0, ws_drop0, ws_steps1, pers_lrn_cnt, pers_mem_cnt, pers_mem_rpt, pers_mem_rcl, pers_rank, y, n_models, weighted):
+    def __init__(self, s1, s2, s3, dae_steps, dae_dropn, ws_steps0, ws_drop0, ws_steps1, pers_lrn_cnt, pers_mem_cnt, pers_mem_rpt, pers_mem_rcl, pers_rank, n_models, weighted):
 
         self.s1  = s1  #dae sep-sl
         self.s2  = s2  #sep-sl
@@ -540,177 +618,168 @@ class MyEvaluator:
         self.pers_mem_rcl = pers_mem_rcl
         self.pers_rank    = pers_rank
 
-        self.y = y
         self.n_models = n_models
         self.weighted = weighted
 
-        self.params = { 's1': s1, 's2':s2, 's3':s3, 'dae': (dae_steps,dae_dropn), 'ws': (ws_steps0,ws_drop0,ws_steps1), 'pers': (pers_lrn_cnt,pers_mem_cnt,pers_mem_rpt,pers_mem_rcl,pers_rank), 'y': y, 'n_models': n_models, 'weighted': weighted }
+        self.params = { 's1': s1, 's2':s2, 's3':s3, 'dae': (dae_steps,dae_dropn), 'ws': (ws_steps0,ws_drop0,ws_steps1), 'pers': (pers_lrn_cnt,pers_mem_cnt,pers_mem_rpt,pers_mem_rcl,pers_rank), 'n_models': n_models, 'weighted': weighted }
 
     def evaluate(self, env, lrn):
-        from statistics import mean
-        from sklearn.metrics import roc_auc_score, f1_score, balanced_accuracy_score, precision_score, recall_score
         from copy import deepcopy
+        from numpy import nanmean
+        from sklearn.metrics import roc_auc_score, f1_score, balanced_accuracy_score, precision_score, recall_score
         from collections import Counter
-        import peft
-        
-        rng = cb.CobaRandom(env.params['rng'])
-        torch.manual_seed(env.params['rng'])
+
+        X,Y,G = env.get_data()
+        if len(X) == 0: return
+
         torch.set_num_threads(1)
 
-        def make_weighted(G):
+        def make_weights(G):
             W = torch.zeros((len(G),1))
             weights = Counter(G.tolist())
             for g,w in weights.items():
                 W[G==g] = 1/w
             return (W / W.max())
+        
+        def get_trn_tst(G,g):
+            is_tst = sum(G == i for i in g).bool() #type: ignore
+            return ~is_tst, is_tst
 
-        mods_opts = []
-        opts = []
+        def get_scores(X,Y,G,g,N,env):
 
-        n_feats = env.test()[0].shape[1]
-        n_persons = len(set(env.train()[2].tolist()))
-        n_y = len(self.y)
+            torch.manual_seed(env.params['rng'])
 
-        self.s1 = [n_feats if f == 'x' else f if f != '-x' else n_feats*n_persons for f in self.s1]
-        self.s2 = [n_feats if f == 'x' else f for f in self.s2]
-        self.s3 = [n_feats if f == 'x' else f for f in self.s3]
+            is_trn, is_tst = get_trn_tst(G,g)
+            trn_X, trn_Y, trn_G = X[is_trn], Y[is_trn], G[is_trn]
+            tst_X, tst_Y, tst_G = X[is_tst], Y[is_tst], G[is_tst]
+            #469 [1] -- 492 [1] -- 472 [1] -- 432 [1] -- 431 [1] -- 430 [1] -- 413 [1]
+            #421 [0] -- 498 [1]
+            try:
+                next(StratifiedShuffleSplit(1,train_size=N).split(tst_X,tst_Y))
+            except Exception as ex:
+                return
+            
+            if len(set(tst_Y.squeeze().tolist())) == 1:
+                return
+            
+            return
 
-        if self.s2 and self.s2[-1] == -1: self.s2 = (*(self.s2)[:-1], n_persons*n_y)
-        if self.s3 and self.s3[ 0] == -1: self.s3 = (n_persons*n_y, *(self.s3)[1:])
+            n_feats = X.shape[1]
+            n_persons = len(set(trn_G.tolist()))
+            n_tasks = Y.shape[1]
 
-        for _ in range(self.n_models):
-            s1 = FeedForward(self.s1)
-            s2 = FeedForward(self.s2)
-            s3 = FeedForward(self.s3)
+            _s1 = [n_feats if f == 'x' else f if f != '-x' else n_feats*n_persons for f in self.s1]
+            _s2 = [n_feats if f == 'x' else f                                     for f in self.s2]
+            _s3 = [n_feats if f == 'x' else f                                     for f in self.s3]
 
-            s1_children = list(s1.children())
-            s2_children = list(s2.children())
+            _s1 = [n_tasks if f == 'y' else f for f in _s1]
+            _s2 = [n_tasks if f == 'y' else f for f in _s2]
+            _s3 = [n_tasks if f == 'y' else f for f in _s3]
 
-            sa = torch.nn.Sequential(*s1_children[len(s1_children)-self.dae_dropn:])
-            s1 = torch.nn.Sequential(*s1_children[:len(s1_children)-self.dae_dropn])
-
-            sb = torch.nn.Sequential(*s2_children[len(s2_children)-self.ws_drop0:])
-            s2 = torch.nn.Sequential(*s2_children[:len(s2_children)-self.ws_drop0])
-
-            s1opt = COCOB(s1.parameters()) if list(s1.parameters()) else None
-            saopt = COCOB(sa.parameters()) if list(sa.parameters()) else None
-            s2opt = COCOB(s2.parameters()) if list(s2.parameters()) else None
-            sbopt = COCOB(sb.parameters()) if list(sb.parameters()) else None
-            s3opt = COCOB(s3.parameters()) if list(s3.parameters()) else None
-
-            mods = [s1,sa,s2,sb,s3]
-            opts = [s1opt,saopt,s2opt,sbopt,s3opt]
-            mods_opts.append([mods,opts])
-
-        for mods,_ in mods_opts:
-            for l in mods: l.train()
-
-        for mods,opts in mods_opts:
-            [s1,sa,s2,sb,s3] = mods
-            [s1opt,saopt,s2opt,sbopt,s3opt] = opts
-
-            if self.s1 and self.dae_steps:
-                opts = list(filter(None,[s1opt,saopt]))
-                X,_,G = env.train()
-                W = make_weighted(G)
-
-                if self.s1[-1] != n_feats*n_persons:
-                    Z = X
-                else:
-                    i = defaultdict(lambda c= count(0):next(c))
-                    I = torch.tensor([[i[g]] for g in G.tolist()])*n_feats + torch.arange(n_feats).unsqueeze(0)
-                    R = torch.arange(len(X)).unsqueeze(1)
-                    Z = torch.full((len(G),len(i)*n_feats), float('nan'))
-                    Z[R,I] = X
-
-                torch_dataset = torch.utils.data.TensorDataset(X,Z,W)
-                torch_loader  = torch.utils.data.DataLoader(torch_dataset,batch_size=8,drop_last=True,shuffle=True)
-
-                loss = torch.nn.L1Loss()
-                for _ in range(self.dae_steps):
-                    for (_X,_z,_w) in torch_loader:
-                        for o in opts: o.zero_grad()
-                        loss(sa(s1(_X.nan_to_num()))[~_z.isnan()],_z[~_z.isnan()]).backward()                        
-                        for o in opts: o.step()
-
-            if self.ws_steps0:
-                opts = list(filter(None,[s1opt,s2opt,sbopt]))
-                for o in opts: o.zero_grad()
-
-                X, Y, G = env.train()
-                Y = Y[:,self.y]
-                W = make_weighted(G)
-
-                if self.s2[-1] != n_y*n_persons:
-                    Z = Y
-                else:
-                    i = defaultdict(lambda c= count(0):next(c))
-                    I = torch.tensor([[i[g]] for g in G.tolist()]) * n_y + torch.arange(n_y).unsqueeze(0)
-                    R = torch.arange(len(Y)).unsqueeze(1)
-                    Z = torch.full((len(G),len(i)*len(self.y)), float('nan'))
-                    Z[R,I] = Y
-
-                torch_dataset = torch.utils.data.TensorDataset(X,Z,W)
-                torch_loader  = torch.utils.data.DataLoader(torch_dataset,batch_size=8,drop_last=True,shuffle=True)
-
-                for _ in range(self.ws_steps0):
-                    for _X,_z,_w in torch_loader:
-                        for o in opts: o.zero_grad()                        
-                        loss = torch.nn.BCEWithLogitsLoss(weight=_w.squeeze() if 2 in self.weighted else None)
-                        loss(sb(s2(s1(_X.nan_to_num())))[~_z.isnan()],_z[~_z.isnan()]).backward()
-                        for o in opts: o.step()
-
-            if self.ws_steps1:
-                opts = list(filter(None,[s3opt] if self.ws_steps0 else [s1opt,s2opt,s3opt]))
-                for o in opts: o.zero_grad()
-
-                X, Y, G = env.train()
-                Y = Y[:,self.y]
-                W = make_weighted(G)
-
-                torch_dataset = torch.utils.data.TensorDataset(X,Y,W)
-                torch_loader  = torch.utils.data.DataLoader(torch_dataset,batch_size=8,drop_last=True,shuffle=True)
-
-                loss = torch.nn.BCEWithLogitsLoss()
-                for _ in range(self.ws_steps1):
-                    for _X,_y,_w in torch_loader:
-                        for o in opts: o.zero_grad()
-                        loss = torch.nn.BCEWithLogitsLoss(weight=_w if 3 in self.weighted else None)
-                        loss(s3(s2(s1(_X.nan_to_num()))),_y).backward()
-                        for o in opts: o.step()
-
-        for mods,_ in mods_opts:
-            for l in mods: l.eval()
-
-        N = 20
-        scores = [ [] for _ in range(N+1) ]
-        unchanged_mods_opts = mods_opts
-
-        for j in range(90):
+            if _s2 and _s2[-1] == -1: _s2 = (*(_s2)[:-1], n_persons*n_tasks)
+            if _s3 and _s3[ 0] == -1: _s3 = (n_persons*n_tasks, *(_s3)[1:])
 
             mods_opts = []
-            for mods,opts in unchanged_mods_opts:
-                mods = deepcopy(mods)
-                opts = deepcopy(opts)
+            opts = []
+
+            for _ in range(self.n_models):
+                s1 = FeedForward(_s1)
+                s2 = FeedForward(_s2)
+                s3 = FeedForward(_s3)
+
+                s1_children = list(s1.children())
+                s2_children = list(s2.children())
+
+                sa = torch.nn.Sequential(*s1_children[len(s1_children)-self.dae_dropn:])
+                s1 = torch.nn.Sequential(*s1_children[:len(s1_children)-self.dae_dropn])
+
+                sb = torch.nn.Sequential(*s2_children[len(s2_children)-self.ws_drop0:])
+                s2 = torch.nn.Sequential(*s2_children[:len(s2_children)-self.ws_drop0])
+
+                s1opt = COCOB(s1.parameters()) if list(s1.parameters()) else None
+                saopt = COCOB(sa.parameters()) if list(sa.parameters()) else None
+                s2opt = COCOB(s2.parameters()) if list(s2.parameters()) else None
+                sbopt = COCOB(sb.parameters()) if list(sb.parameters()) else None
+                s3opt = COCOB(s3.parameters()) if list(s3.parameters()) else None
+
+                mods = [s1,sa,s2,sb,s3]
+                opts = [s1opt,saopt,s2opt,sbopt,s3opt]
                 mods_opts.append([mods,opts])
 
-            X, Y = env.test()
-            trn,tst = next(StratifiedShuffleSplit(1,train_size=N/len(X),random_state=j).split(X,Y))
-            X = X[np.hstack([trn,tst])]
-            Y = Y[np.hstack([trn,tst]),:][:,self.y]
+            for mods,_ in mods_opts:
+                for m in mods: m.train()
 
             for mods,opts in mods_opts:
-                if not self.pers_rank:
-                    opts[-1] = COCOB(mods[-1].parameters()) if opts[-1] else None
-                else:
-                    targets  = [ n for n, m in mods[-1].named_modules() if isinstance(m,torch.nn.Linear)]
-                    config   = peft.LoraConfig(r=self.pers_rank, target_modules=targets)
-                    mods[-1] = peft.get_peft_model(mods[-1], config)
-                    opts[-1] = COCOB(mods[-1].parameters())
+                [s1,sa,s2,sb,s3] = mods
+                [s1opt,saopt,s2opt,sbopt,s3opt] = opts
 
-            lrnxs = [[] for _ in range(len(mods_opts))]
-            lrnys = [[] for _ in range(len(mods_opts))]
-            memss = [[] for _ in range(len(mods_opts))]
+                if _s1 and self.dae_steps:
+                    opts = list(filter(None,[s1opt,saopt]))
+                    X,G,W = trn_X,trn_G,make_weights(trn_G)
+
+                    if _s1[-1] != n_feats*n_persons:
+                        Z = X
+                    else:
+                        i = defaultdict(lambda c= count(0):next(c))
+                        I = torch.tensor([[i[g]] for g in G.tolist()]) * n_feats + torch.arange(n_feats).unsqueeze(0)
+                        R = torch.arange(len(X)).unsqueeze(1)
+                        Z = torch.full((len(X),len(i)*n_feats), float('nan'))
+                        Z[R,I] = X
+
+                    torch_dataset = torch.utils.data.TensorDataset(X,Z,W)
+                    torch_loader  = torch.utils.data.DataLoader(torch_dataset,batch_size=8,drop_last=True,shuffle=True)
+
+                    loss = torch.nn.L1Loss()
+                    for _ in range(self.dae_steps):
+                        for (_X,_z,_w) in torch_loader:
+                            for o in opts: o.zero_grad()
+                            loss(sa(s1(_X.nan_to_num()))[~_z.isnan()],_z[~_z.isnan()]).backward()                        
+                            for o in opts: o.step()
+
+                if self.ws_steps0:
+                    opts = list(filter(None,[s1opt,s2opt,sbopt]))
+                    for o in opts: o.zero_grad()
+
+                    X, Y, G, W = trn_X,trn_Y,trn_G,make_weights(trn_G)
+
+                    if _s2[-1] != n_tasks*n_persons:
+                        Z = Y
+                    else:
+                        i = defaultdict(lambda c= count(0):next(c))
+                        I = torch.tensor([[i[g]] for g in G.tolist()]) * n_tasks + torch.arange(n_tasks).unsqueeze(0)
+                        R = torch.arange(len(Y)).unsqueeze(1)
+                        Z = torch.full((len(G),len(i)*n_tasks), float('nan'))
+                        Z[R,I] = Y
+
+                    torch_dataset = torch.utils.data.TensorDataset(X,Z,W)
+                    torch_loader  = torch.utils.data.DataLoader(torch_dataset,batch_size=8,drop_last=True,shuffle=True)
+
+                    for _ in range(self.ws_steps0):
+                        for _X,_z,_w in torch_loader:
+                            for o in opts: o.zero_grad()                        
+                            loss = torch.nn.BCEWithLogitsLoss(weight=_w.squeeze() if 2 in self.weighted else None)
+                            loss(sb(s2(s1(_X.nan_to_num())))[~_z.isnan()],_z[~_z.isnan()]).backward()
+                            for o in opts: o.step()
+
+                if self.ws_steps1:
+                    opts = list(filter(None,[s3opt] if self.ws_steps0 else [s1opt,s2opt,s3opt]))
+                    for o in opts: o.zero_grad()
+
+                    X, Y, G, W = trn_X,trn_Y,trn_G,make_weights(trn_G)
+
+                    torch_dataset = torch.utils.data.TensorDataset(X,Y,W)
+                    torch_loader  = torch.utils.data.DataLoader(torch_dataset,batch_size=8,drop_last=True,shuffle=True)
+
+                    loss = torch.nn.BCEWithLogitsLoss()
+                    for _ in range(self.ws_steps1):
+                        for _X,_y,_w in torch_loader:
+                            for o in opts: o.zero_grad()
+                            loss = torch.nn.BCEWithLogitsLoss(weight=_w if 3 in self.weighted else None)
+                            loss(s3(s2(s1(_X.nan_to_num()))),_y).backward()
+                            for o in opts: o.step()
+
+            for mods,_ in mods_opts:
+                for m in mods: m.eval()
 
             def predict(X):
                 preds = torch.tensor(0)
@@ -720,165 +789,119 @@ class MyEvaluator:
                 return preds/len(mods_opts)
 
             def score(X,Y):
+                out = dict()
                 with torch.no_grad():
-                    out = {}
                     probs = predict(X)
                     preds = (probs>=.5).float()
-                    for i,y in enumerate(self.y):
+                    for i in range(n_tasks):
 
-                        tp = ((preds[:,i]==1) & (Y[:,y]==1)).float().mean().item()
-                        tn = ((preds[:,i]==0) & (Y[:,y]==0)).float().mean().item()
-                        fp = ((preds[:,i]==1) & (Y[:,y]==0)).float().mean().item()
-                        fn = ((preds[:,i]==0) & (Y[:,y]==1)).float().mean().item()
+                        one = len(set(Y[:,i].tolist())) == 1
 
-                        out[f"auc{i}"] = roc_auc_score(Y[:,y],probs[:,i])
-                        out[f"bal{i}"] = balanced_accuracy_score(Y[:,y],preds[:,i])
-                        out[f"sen{i}"] = tp/(tp+fn)
-                        out[f"spe{i}"] = tn/(tn+fp)
+                        tp = ((preds[:,i]==1) & (Y[:,i]==1)).float().mean().item()
+                        tn = ((preds[:,i]==0) & (Y[:,i]==0)).float().mean().item()
+                        fp = ((preds[:,i]==1) & (Y[:,i]==0)).float().mean().item()
+                        fn = ((preds[:,i]==0) & (Y[:,i]==1)).float().mean().item()
+
+                        out[f"auc{i}"] = float('nan') if one else roc_auc_score(Y[:,i],probs[:,i])
+                        out[f"bal{i}"] = float('nan') if one else balanced_accuracy_score(Y[:,i],preds[:,i])
+                        out[f"sen{i}"] = float('nan') if one else tp/(tp+fn)
+                        out[f"spe{i}"] = float('nan') if one else tn/(tn+fp)
 
                         for j in [0,1]:
-                            out[f"f1{j}{i}" ] = f1_score(Y[:,y],preds[:,i],pos_label=j)
-                            out[f"pre{j}{i}"] = precision_score(Y[:,y],preds[:,i],pos_label=j,zero_division=0)
-                            out[f"rec{j}{i}"] = recall_score(Y[:,y],preds[:,i],pos_label=j)
+                            out[f"f1{j}{i}" ] = float('nan') if one else f1_score(Y[:,i],preds[:,i],pos_label=j)
+                            out[f"pre{j}{i}"] = float('nan') if one else precision_score(Y[:,i],preds[:,i],pos_label=j,zero_division=0)
+                            out[f"rec{j}{i}"] = float('nan') if one else recall_score(Y[:,i],preds[:,i],pos_label=j)
 
-                        out[f"f1m{i}"] = f1_score(Y[:,y],preds[:,i],average='macro')
-                        out[f"f1w{i}"] = f1_score(Y[:,y],preds[:,i],average='weighted')
+                        out[f"f1m{i}"] = float('nan') if one else f1_score(Y[:,i],preds[:,i],average='macro')
+                        out[f"f1w{i}"] = float('nan') if one else f1_score(Y[:,i],preds[:,i],average='weighted')
 
-                    return out
+                return out
 
-            scores[0].append(score(X[N:,:], Y[N:,:]))
+            scores = [ [] for _ in range(N+1) ]
+            unchanged_mods_opts = mods_opts
 
-            loss = torch.nn.BCEWithLogitsLoss()
-            for i in range(N):
+            X,Y = tst_X, tst_Y
 
-                for lrnx,lrny,mems,(mods,opts) in zip(lrnxs,lrnys,memss,mods_opts):
-                    [s1,_,s2,_,s3 ] = mods
-                    [_,_,_,_,s3opt] = opts
+            for j in range(15):
 
-                    x,y = X[i,:], Y[i,:]
+                mods_opts = []
+                for mods,opts in unchanged_mods_opts:
+                    mods = deepcopy(mods)
+                    opts = deepcopy(opts)
+                    mods_opts.append([mods,opts])
 
-                    if self.pers_lrn_cnt:
-                        lrnx.append(x)
-                        lrny.append(y)
+                trn,tst = next(StratifiedShuffleSplit(1,train_size=N,random_state=j).split(X,Y))
+                trn_X,trn_Y = X[trn],Y[trn]
+                scr_X,scr_Y = X[tst],Y[tst]
 
-                        if self.pers_mem_cnt: 
-                            mems.append([x,y,self.pers_mem_rpt])
+                for mods,opts in mods_opts:
+                    if not self.pers_rank:
+                        opts[-1] = COCOB(mods[-1].parameters()) if opts[-1] else None
 
-                        if len(mems) > self.pers_mem_cnt and self.pers_mem_rcl > rng.random():
-                            rng.shuffle(mems, inplace=True)
-                            for j in reversed(range(1 if self.pers_mem_rcl < 1 else self.pers_mem_rcl)):
-                                if j >= len(mems): continue
-                                x,y,n = mems[j]
-                                lrnx.append(x)
-                                lrny.append(y)
-                                if n == 1: mems.pop(j)
-                                else: mems[j] = [x,y,n-1]
+                lrnxs = [[] for _ in range(len(mods_opts))]
+                lrnys = [[] for _ in range(len(mods_opts))]
+                memss = [[] for _ in range(len(mods_opts))]
 
-                        if len(lrnx) >= self.pers_lrn_cnt:
-                            x = torch.stack(lrnx[:self.pers_lrn_cnt])
-                            y = torch.stack(lrny[:self.pers_lrn_cnt])
+                scores[0].append(score(scr_X, scr_Y))
 
-                            if s3opt:
-                                if s3opt: s3opt.zero_grad()
-                                loss(s3(s2(s1(x.nan_to_num()))),y).backward()
-                                if s3opt: s3opt.step()
+                rng = cb.CobaRandom(1)
 
-                            del lrnx[:self.pers_lrn_cnt]
-                            del lrny[:self.pers_lrn_cnt]
+                loss = torch.nn.BCEWithLogitsLoss()
+                for i in range(N):
 
-                scores[i+1].append(score(X[N:,:], Y[N:,:]))
+                    for lrnx,lrny,mems,(mods,opts) in zip(lrnxs,lrnys,memss,mods_opts):
+                        [s1,_,s2,_,s3 ] = mods
+                        [_,_,_,_,s3opt] = opts
 
-        for s in scores:
-            yield {k:mean([s_[k] for s_ in s]) for k in s[0].keys()}
+                        x,y = trn_X[i,:], trn_Y[i,:]
 
-def make_envs(X, Y, G, R, feats):
+                        if self.pers_lrn_cnt:
+                            lrnx.append(x)
+                            lrny.append(y)
 
-    too_short = set(g for g in set(G.tolist()) if (g==G).sum() < 30)
-    all_equal = set(g for g in set(G.tolist()) if any(len(set(y.tolist()))==1 for y in Y[g==G].T))
+                            if self.pers_mem_cnt: 
+                                mems.append([x,y,self.pers_mem_rpt])
 
-    if any(all_equal): print(f"All Equal, no environment added for {sorted(all_equal)}")
+                            if len(mems) > self.pers_mem_cnt:
+                                rng.shuffle(mems, inplace=True)
+                                for j in reversed(range(self.pers_mem_rcl)):
+                                    if j >= len(mems): continue
+                                    x,y,n = mems[j]
+                                    lrnx.append(x)
+                                    lrny.append(y)
+                                    if n == 1: mems.pop(j)
+                                    else: mems[j] = [x,y,n-1]
 
-    for rng,g in product(range(R),sorted(set(G.tolist())-all_equal-too_short)):
-        try:
-            next(StratifiedShuffleSplit(1,random_state=rng).split(X[g==G], Y[g==G]))
-            yield MyEnvironment(X[g!=G], Y[g!=G], G[g!=G], X[g==G], Y[g==G], feats, g, rng)
-        except ValueError as e:
-            if 'The least populated class in y has only 1 member' in str(e): continue
-            raise
+                            if len(lrnx) >= self.pers_lrn_cnt:
+                                x = torch.stack(lrnx[:self.pers_lrn_cnt])
+                                y = torch.stack(lrny[:self.pers_lrn_cnt])
 
-def _work_items(hrs,scs,lins,bats,peds,locs,init,freq,lmin,lmax,ind):
-    for pid in sorted(can_predict["ParticipantId"].drop_duplicates().tolist()):
-        sub  = can_predict[can_predict.ParticipantId == pid]
-        tss  = sub["SubmissionTimestampUtc"].tolist()
-        tzs  = sub["LocalTimeZone"].tolist()
-        ys   = sub["ER Interest"].tolist()
-        args = [[hrs],[scs],[lins],[bats],[peds],[locs,init,freq,lmin,lmax]]
-        yield pid,tss,tzs,ys,args,ind
+                                if s3opt:
+                                    if s3opt: s3opt.zero_grad()
+                                    loss(s3(s2(s1(x.nan_to_num()))),y).backward()
+                                    if s3opt: s3opt.step()
 
-def _make_xyg3(work_item):
-    (pid,ts,tz,ys,args,ind) = work_item
-    #hrs, scs, lins, bats, peds, locs
-    fs = [
-        list(locs1(pid,ts,*args[5])),
-        list(lins1(pid,ts,*args[2])),
-        list(scs(pid,ts,*args[1])),
-        list(hrs(pid,ts,*args[0])),
-        list(tims(ts,tz)),
-        list(bats(pid,ts,*args[3])),
-        list(peds(pid,ts,*args[4]))
-    ]
+                                del lrnx[:self.pers_lrn_cnt]
+                                del lrny[:self.pers_lrn_cnt]
 
-    if ind:
-        for f in fs:
-            add1(f)
+                    scores[i+1].append(score(scr_X, scr_Y))
 
-    xs = [list(chain.from_iterable(feats)) for feats in zip(*fs)]
-    ys = [float(y<np.mean(ys)) for y in ys]
-    gs = [pid]*len(ys)
-    return xs,ys,gs
+            for s in scores:
+                yield {k:nanmean([s_[k] for s_ in s]) for k in s[0].keys()}
 
-def _make_xyg1(work_item):
-    (pid,ts,tz,ys,args,ind) = work_item
-    #hrs, scs, lins, bats, peds, locs
-    fs = [
-        list(locs1(pid,ts,*args[5])),
-        list(lins1(pid,ts,*args[2])),
-        list(tims(ts,tz)),
-        list(bats(pid,ts,*args[3])),
-        list(peds(pid,ts,*args[4]))
-    ]
+        yield from get_scores(X,Y[:,env.L],G,env.g,20,env)
 
-    if ind:
-        for f in fs:
-            add1(f)
+testable_G = cb.CobaRandom(1).shuffle([k for k,n in Counter(G.tolist()).items() if n >= 30])
 
-    xs = [list(chain.from_iterable(feats)) for feats in zip(*fs)]
-    ys = [float(y<np.mean(ys)) for y in ys]
-    gs = [pid]*len(ys)
-    return xs,ys,gs
+x = [0,300]
+L = [[0],[1]]
+A = product([True],x,x,x,x,x,x,x,[0],[True,False],[True],["del"])
 
-hour=60*(minute:=60)
-envs = []
-
-with ProcessPoolExecutor(max_workers=20) as executor:
-    X,Y,G = zip(*executor.map(_make_xyg1, _work_items(30,30,30,3600,30,3600,'geometric',2,1,10,False)))
-    X = torch.tensor(list(chain.from_iterable(X))).float()
-    Y = torch.tensor(list(chain.from_iterable(Y))).float().unsqueeze(1)
-    G = torch.tensor(list(chain.from_iterable(G))).int()
-    envs.extend(make_envs(X,Y,G,15,('xyg1',1,2,30,3600,False)))
-
-# with ProcessPoolExecutor(max_workers=20) as executor:
-#     X,Y,G = zip(*executor.map(_make_xyg1, _work_items(30,30,30,3600,30,3600,'geometric',2,1,10,True)))
-#     X = torch.tensor(list(chain.from_iterable(X))).float()
-#     Y = torch.tensor(list(chain.from_iterable(Y))).float().unsqueeze(1)
-#     G = torch.tensor(list(chain.from_iterable(G))).int()
-#     envs.extend(make_envs(X,Y,G,15,('xyg1',1,2,30,3600,True)))
-
-clear_output()
+envs = [ MyEnvironment(a,l,[g],rng) for a in A for g in testable_G for rng in range(1) for l in L ]
 
 lrns = [ None ]
-vals = [ 
-    MyEvaluator(('x',.3,120,'l','r',120,'l','r','-x'), (120,90,'l','r',-1), (90,1), 2, 4, 4, 1, 4, 3, 2, 2, 2, 0, [0], 1, [3]),
+vals = [
+    MyEvaluator((), ('x',120,'l','r',90,'l','r',-1), (90,'y'), 0, 0, 4, 1, 4, 3, 2, 2, 2, 0, 1, []),
 ]
 
 cb.Experiment(envs,lrns,vals).run(processes=1,quiet=True) #type: ignore
